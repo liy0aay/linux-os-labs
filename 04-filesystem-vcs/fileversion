@@ -1,0 +1,183 @@
+#!/bin/bash
+set -euo pipefail
+
+# lightweight version control system using Linux hard links and inode tracking
+# supports init, commit, and restore operations with metadata stored in JSON
+
+COMMAND="${1:-}"
+TARGET_FILE="${2:-}"
+ARG3="${3:-}" 
+
+HIDDEN_DIR="$HOME/.fileversions"
+
+get_inode() { stat -c %i "$1"; }
+get_size()  { stat -c %s "$1"; }
+get_hash()  { sha256sum "$1" | awk '{print $1}'; }
+get_timestamp() { date +"%Y-%m-%d_%H-%M-%S"; }
+get_datetime()  { date +"%Y-%m-%d %H:%M:%S"; }
+
+log_err() { echo "Error: $1" >&2; exit 1; }
+
+if ! command -v jq &> /dev/null; then
+    log_err "'jq' is required for JSON processing, please install it"
+fi
+
+case "$COMMAND" in
+    init)
+        [[ -f "$TARGET_FILE" ]] || log_err "file '$TARGET_FILE' not found"
+
+        BASE_NAME=$(basename "$TARGET_FILE")
+        DIR="$HIDDEN_DIR/$BASE_NAME"
+        VERSIONS_DIR="$DIR/versions"
+        METADATA_FILE="$DIR/metadata.json"
+
+        if [[ -d "$DIR" ]]; then
+            log_err "version control already initialized for this file"
+        fi
+
+        mkdir -p "$VERSIONS_DIR"
+
+        INODE=$(get_inode "$TARGET_FILE")
+        SIZE=$(get_size "$TARGET_FILE")
+        HASH=$(get_hash "$TARGET_FILE")
+        TS=$(get_timestamp)
+        DT=$(get_datetime)
+
+        VNAME="v1_$TS"
+
+        ln "$TARGET_FILE" "$VERSIONS_DIR/$VNAME"
+        ln -sfn "versions/$VNAME" "$DIR/current_version"
+
+        jq -n \
+          --arg fn "$TARGET_FILE" \
+          --arg bn "$BASE_NAME" \
+          --arg vname "$VNAME" \
+          --arg dt "$DT" \
+          --argjson inode "$INODE" \
+          --argjson size "$SIZE" \
+          --arg hash "sha256:$HASH" \
+          '{
+            filename: $fn,
+            basename: $bn,
+            versions: [{
+              id: 1,
+              name: $vname,
+              timestamp: $dt,
+              inode: $inode,
+              size: $size,
+              comment: "Initial version",
+              hash: $hash
+            }],
+            current_version: 1,
+            created: $dt,
+            last_updated: $dt
+          }' > "$METADATA_FILE"
+
+        echo "Version control initialized for $TARGET_FILE"
+        ;;
+
+    commit)
+        [[ -f "$TARGET_FILE" ]] || log_err "file '$TARGET_FILE' not found"
+
+        BASE_NAME=$(basename "$TARGET_FILE")
+        DIR="$HIDDEN_DIR/$BASE_NAME"
+        METADATA_FILE="$DIR/metadata.json"
+
+        [[ -d "$DIR" ]] || log_err "run 'init' first"
+
+        INODE_NOW=$(get_inode "$TARGET_FILE")
+        CURRENT_PATH=$(readlink -f "$DIR/current_version")
+        INODE_OLD=$(get_inode "$CURRENT_PATH")
+
+        if [[ "$INODE_NOW" -eq "$INODE_OLD" ]]; then
+            echo "no changes detected"
+            exit 0
+        fi
+
+        if jq -e ".versions[] | select(.inode == $INODE_NOW)" "$METADATA_FILE" >/dev/null; then
+            echo "this  version is already committed"
+            exit 0
+        fi
+
+        LAST_ID=$(jq '.versions[-1].id' "$METADATA_FILE")
+        NEW_ID=$((LAST_ID + 1))
+
+        TS=$(get_timestamp)
+        DT=$(get_datetime)
+        VNAME="v${NEW_ID}_$TS"
+        COMMENT="${ARG3:-No comment}"
+
+        ln "$TARGET_FILE" "$DIR/versions/$VNAME"
+        ln -sfn "versions/$VNAME" "$DIR/current_version"
+
+        INODE=$(get_inode "$TARGET_FILE")
+        SIZE=$(get_size "$TARGET_FILE")
+        HASH=$(get_hash "$TARGET_FILE")
+
+        TMP_FILE=$(mktemp)
+        jq \
+          --arg vname "$VNAME" \
+          --arg dt "$DT" \
+          --argjson id "$NEW_ID" \
+          --argjson inode "$INODE" \
+          --argjson size "$SIZE" \
+          --arg comment "$COMMENT" \
+          --arg hash "sha256:$HASH" \
+          '.versions += [{
+            id: $id,
+            name: $vname,
+            timestamp: $dt,
+            inode: $inode,
+            size: $size,
+            comment: $comment,
+            hash: $hash
+          }] | .current_version = $id | .last_updated = $dt' "$METADATA_FILE" > "$TMP_FILE"
+
+        mv "$TMP_FILE" "$METADATA_FILE"
+
+        echo "committed version $NEW_ID: $COMMENT"
+        ;;
+
+    restore)
+        [[ -n "$TARGET_FILE" ]] || log_err "target file required"
+
+        VERSION="$ARG3"
+        BASE_NAME=$(basename "$TARGET_FILE")
+        DIR="$HIDDEN_DIR/$BASE_NAME"
+        METADATA_FILE="$DIR/metadata.json"
+
+        [[ -d "$DIR" ]] || log_err "not initialized"
+        [[ -n "$VERSION" ]] || log_err "version required"
+
+        if [[ "$VERSION" == "latest" ]]; then
+            VNAME=$(readlink "$DIR/current_version" | xargs basename)
+            VERSION_ID=$(jq '.current_version' "$METADATA_FILE")
+        else
+            VNAME=$(jq -r ".versions[] | select(.id == $VERSION) | .name" "$METADATA_FILE")
+            [[ -z "$VNAME" || "$VNAME" == "null" ]] && log_err "version $VERSION not found in metadata"
+            VERSION_ID="$VERSION"
+        fi
+
+        VPATH="$DIR/versions/$VNAME"
+        [[ -f "$VPATH" ]] || log_err "version file $VPATH not found"
+
+        rm -f "$TARGET_FILE"
+        ln "$VPATH" "$TARGET_FILE"
+
+        ln -sfn "versions/$VNAME" "$DIR/current_version"
+        
+        TMP_FILE=$(mktemp)
+        jq --argjson id "$VERSION_ID" '.current_version = $id' "$METADATA_FILE" > "$TMP_FILE"
+        mv "$TMP_FILE" "$METADATA_FILE"
+
+        echo "checked out version $VNAME to $TARGET_FILE"
+        ;;
+
+    *)
+        echo "Usage:"
+        echo "  $0 init <file>"
+        echo "  $0 commit <file> [comment]"
+        echo "  $0 restore <file> <version|latest>"
+        exit 1
+        ;;
+esac

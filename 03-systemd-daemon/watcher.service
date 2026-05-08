@@ -1,0 +1,13 @@
+[Unit]
+Description=Process Watcher Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/watcher/watcher.sh
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
